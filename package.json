@@ -1,0 +1,15 @@
+{
+  "name": "ai-chatbot-backend",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "node codex-openai-proxy.mjs",
+    "start": "node codex-openai-proxy.mjs",
+    "tunnel": "./start-tunnel.sh",
+    "tunnel:named": "./start-tunnel.sh"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5"
+  }
+}

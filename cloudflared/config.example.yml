@@ -1,0 +1,13 @@
+# Copy to ~/.cloudflared/config.yml (or pass via --config)
+# 1) cloudflared tunnel login
+# 2) cloudflared tunnel create ai-chatbot-backend
+# 3) Replace <TUNNEL-UUID> and domain below
+# 4) cloudflared tunnel route dns ai-chatbot-backend api.your-domain.com
+
+tunnel: <TUNNEL-UUID>
+credentials-file: ~/.cloudflared/<TUNNEL-UUID>.json
+
+ingress:
+  - hostname: api.your-domain.com
+    service: http://127.0.0.1:15722
+  - service: http_status:404
