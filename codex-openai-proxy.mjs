@@ -93,6 +93,8 @@ const CACHE_TTL_MS = Number.parseInt(process.env.CACHE_TTL_MS || "120000", 10);
 const CACHE_MAX_ITEMS = Number.parseInt(process.env.CACHE_MAX_ITEMS || "500", 10);
 const PROXY_DEBUG_VERBOSE =
   (process.env.PROXY_DEBUG_VERBOSE || "false").toLowerCase() !== "false";
+const EMIT_INTERMEDIATE_ASSISTANT_TEXT =
+  (process.env.EMIT_INTERMEDIATE_ASSISTANT_TEXT || "false").toLowerCase() === "true";
 
 const ARTIFACTS_SIGNING_SECRET =
   process.env.ARTIFACTS_SIGNING_SECRET || process.env.AUTH_SECRET || "";
@@ -810,6 +812,86 @@ function sanitizeReasoningText(text) {
     .replace(/[A-Za-z]:\\[^\\s"'`]+/g, "[path]");
 }
 
+function truncateReasoningLine(text, maxLength = 160) {
+  const value = String(text || "").trim();
+  if (!value || value.length <= maxLength) {
+    return value;
+  }
+  return `${value.slice(0, maxLength - 1)}…`;
+}
+
+function toChineseReasoningLine(line) {
+  const value = String(line || "").trim();
+  if (!value) {
+    return "";
+  }
+
+  const stripped = value
+    .replace(/^\*+|\*+$/g, "")
+    .replace(/^【web_search】$/i, "【网页检索】")
+    .replace(/^web_search$/i, "网页检索");
+
+  if (/[\u4e00-\u9fff]/.test(stripped)) {
+    return stripped;
+  }
+
+  const normalized = stripped.toLowerCase();
+  if (/^(planning|plan|scoping|exploring|checking|verifying|validating)/.test(normalized)) {
+    return "【思考】规划下一步处理";
+  }
+  if (/^(generating|creating|building|writing)/.test(normalized)) {
+    return "【思考】生成结果内容";
+  }
+  if (/^(fetching|requesting|querying|searching)/.test(normalized)) {
+    return "【思考】拉取并核对数据";
+  }
+  if (/^(final|finalizing)/.test(normalized)) {
+    return "【思考】整理最终回复";
+  }
+
+  if (/[A-Za-z]{4,}/.test(stripped)) {
+    return "【思考】处理中";
+  }
+  return stripped;
+}
+
+function summarizeCommandForReasoning(command) {
+  const raw = String(command || "");
+  if (!raw.trim()) {
+    return "";
+  }
+
+  const sanitized = sanitizeReasoningText(raw);
+  const oneLine = sanitized.replace(/\r?\n+/g, " ").replace(/\s+/g, " ").trim();
+
+  const artifactMatch = sanitized.match(/artifacts\/[^\s"'`]+/i);
+  const urlMatch = sanitized.match(/https?:\/\/[^\s"'`]+/i);
+  if (/<<\s*['"]?[A-Za-z0-9_]+['"]?/.test(sanitized) || /\n/.test(sanitized)) {
+    if (artifactMatch) {
+      return `生成文件 ${artifactMatch[0]}`;
+    }
+    if (/python\d?/i.test(sanitized)) {
+      return "执行内联 Python 脚本";
+    }
+    if (/node\b/i.test(sanitized)) {
+      return "执行内联 Node 脚本";
+    }
+    return "执行多行脚本";
+  }
+
+  if (artifactMatch) {
+    return `处理文件 ${artifactMatch[0]}`;
+  }
+  if (urlMatch && /\bcurl\b|\bwget\b/i.test(sanitized)) {
+    return `请求接口 ${truncateReasoningLine(urlMatch[0], 96)}`;
+  }
+
+  const unwrapped = oneLine
+    .replace(/^(?:\/bin\/)?bash\s+-lc\s+/i, "")
+    .replace(/^['"]|['"]$/g, "");
+  return truncateReasoningLine(unwrapped, 140);
+}
+
 function prettifyReasoningText(text) {
   if (!text) {
     return "";
@@ -837,7 +919,9 @@ function prettifyReasoningText(text) {
     .filter(Boolean)
     .map((line) =>
       line.replace(/\[(command_execution|file_change|error)\]/gi, (_, key) => `【${labelMap[key.toLowerCase()] || key}】`)
-    );
+    )
+    .map((line) => toChineseReasoningLine(line))
+    .filter(Boolean);
 
   return lines.join("\n");
 }
@@ -856,11 +940,14 @@ function formatCommandExecution(item, { userType = "regular" } = {}) {
     if (/(\bpython\b.*-m\s+pip\s+install|\bpip3?\s+install)\b/i.test(trimmed)) {
       return "";
     }
-    const cleaned = sanitizeReasoningText(trimmed);
-    if (isGuestUserType(userType) && GUEST_SENSITIVE_COMMAND_REGEX.test(trimmed)) {
-      return `【访客模式拦截】\n已拒绝敏感命令：${cleaned}`;
+    const summarized = summarizeCommandForReasoning(trimmed);
+    if (!summarized) {
+      return "";
     }
-    return `【命令执行】\n${cleaned}`;
+    if (isGuestUserType(userType) && GUEST_SENSITIVE_COMMAND_REGEX.test(trimmed)) {
+      return `【访客模式拦截】\n已拒绝敏感命令：${summarized}`;
+    }
+    return `【命令执行】\n${summarized}`;
   }
 
   return "【命令执行】";
@@ -902,7 +989,9 @@ function extractCodexEventParts(obj, { userType = "regular" } = {}) {
       return parts;
     }
 
-    parts.reasoningDelta = prettifyReasoningText(summarizeItemEvent(item));
+    if (item?.type === "file_change") {
+      parts.reasoningDelta = prettifyReasoningText(summarizeItemEvent(item));
+    }
     return parts;
   }
 
@@ -1023,6 +1112,7 @@ function runCodex({
       knownThreadId: knownThreadId || "",
       args,
       configPath: CODEX_CONFIG_PATH,
+      emitIntermediateText: EMIT_INTERMEDIATE_ASSISTANT_TEXT,
       promptLength: String(prompt || "").length,
     });
 
@@ -1034,6 +1124,7 @@ function runCodex({
     let eventCount = 0;
     let textDeltaCount = 0;
     let reasoningDeltaCount = 0;
+    let lastReasoningDelta = "";
 
     child.stdout.on("data", (chunk) => {
       const text = chunk.toString("utf8");
@@ -1068,17 +1159,23 @@ function runCodex({
             userType: normalizedUserType,
           });
           if (reasoningDelta) {
-            reasoningDeltaCount += 1;
-            onReasoningChunk?.(reasoningDelta);
+            const normalizedReasoning = reasoningDelta.trim();
+            if (normalizedReasoning && normalizedReasoning !== lastReasoningDelta) {
+              reasoningDeltaCount += 1;
+              lastReasoningDelta = normalizedReasoning;
+              onReasoningChunk?.(normalizedReasoning);
+            }
           }
 
           if (textDelta) {
             textDeltaCount += 1;
-            if (fullText) {
-              fullText += "\n";
+            if (textDelta.trim()) {
+              // Keep only the latest assistant message to avoid leaking process updates.
+              fullText = textDelta;
             }
-            fullText += textDelta;
-            onTextChunk?.(textDelta);
+            if (EMIT_INTERMEDIATE_ASSISTANT_TEXT) {
+              onTextChunk?.(textDelta);
+            }
           }
 
           if (obj?.run_id || String(obj?.id || "").startsWith("run_")) {
@@ -1119,13 +1216,19 @@ function runCodex({
             userType: normalizedUserType,
           });
           if (reasoningDelta) {
-            onReasoningChunk?.(reasoningDelta);
+            const normalizedReasoning = reasoningDelta.trim();
+            if (normalizedReasoning && normalizedReasoning !== lastReasoningDelta) {
+              lastReasoningDelta = normalizedReasoning;
+              onReasoningChunk?.(normalizedReasoning);
+            }
           }
           if (textDelta) {
-            if (fullText) {
-              fullText += "\n";
+            if (textDelta.trim()) {
+              fullText = textDelta;
             }
-            fullText += textDelta;
+            if (EMIT_INTERMEDIATE_ASSISTANT_TEXT) {
+              onTextChunk?.(textDelta);
+            }
           }
         } catch {
           // ignore tail log noise
@@ -1144,6 +1247,10 @@ function runCodex({
         });
         reject(new Error(message));
         return;
+      }
+
+      if (!EMIT_INTERMEDIATE_ASSISTANT_TEXT && fullText) {
+        onTextChunk?.(fullText);
       }
 
       debugLog(traceTag, "codex_close_ok", {
