@@ -72,8 +72,6 @@ const FORCE_CHINESE_OUTPUT =
   (process.env.FORCE_CHINESE_OUTPUT || "true").toLowerCase() !== "false";
 const FORCE_HTML_BACKTEST_CHART =
   (process.env.FORCE_HTML_BACKTEST_CHART || "true").toLowerCase() !== "false";
-const FORCE_IMAGE_TAG =
-  (process.env.FORCE_IMAGE_TAG || "true").toLowerCase() !== "false";
 const TURNSTILE_ENABLED =
   (process.env.TURNSTILE_ENABLED || "false").toLowerCase() !== "false";
 const TURNSTILE_SECRET = process.env.TURNSTILE_SECRET || "";
@@ -93,6 +91,8 @@ const RATE_LIMIT_MAX_REQUESTS = Number.parseInt(process.env.RATE_LIMIT_MAX_REQUE
 const CACHE_ENABLED = (process.env.CACHE_ENABLED || "true").toLowerCase() !== "false";
 const CACHE_TTL_MS = Number.parseInt(process.env.CACHE_TTL_MS || "120000", 10);
 const CACHE_MAX_ITEMS = Number.parseInt(process.env.CACHE_MAX_ITEMS || "500", 10);
+const PROXY_DEBUG_VERBOSE =
+  (process.env.PROXY_DEBUG_VERBOSE || "false").toLowerCase() !== "false";
 
 const ARTIFACTS_SIGNING_SECRET =
   process.env.ARTIFACTS_SIGNING_SECRET || process.env.AUTH_SECRET || "";
@@ -135,6 +135,11 @@ const FUND_CLASSIFIER_PROMPT = (
 
 const CODEX_BIN = process.env.CODEX_CLI_BIN || process.env.CLAUDE_CLI_BIN || "codex";
 const CODEX_MODEL = process.env.CODEX_MODEL || process.env.CLAUDE_CODE_MODEL || "gpt-5-codex";
+const CODEX_CONFIG_FILE = (process.env.CODEX_CONFIG_FILE || "config/config.toml").trim();
+const CODEX_CONFIG_PATH = path.isAbsolute(CODEX_CONFIG_FILE)
+  ? CODEX_CONFIG_FILE
+  : path.resolve(backendRoot, CODEX_CONFIG_FILE);
+const CODEX_CONFIG_HOME = path.dirname(CODEX_CONFIG_PATH);
 const CODEX_SKIP_APPROVALS =
   (process.env.CODEX_DANGEROUSLY_BYPASS_APPROVALS_AND_SANDBOX || "true").toLowerCase() === "true";
 const CODEX_DISABLE_RESUME =
@@ -165,6 +170,8 @@ const BACKTEST_KEYWORD_REGEX =
   /(回测|定投|轮动|区间收益|收益对比|历史收益|年化|最大回撤|波动率|夏普|胜率|净值曲线|再平衡|策略表现|backtest|dca|momentum|drawdown|cagr|sharpe)/i;
 const CAPABILITY_QUERY_REGEX =
   /(你能做什么|你有哪些功能|你会什么|怎么用|功能清单|能力清单|可用功能|help|capabilities)/i;
+const GUEST_SENSITIVE_COMMAND_REGEX =
+  /(^|[;&|]\s*)(git\s+push|rm(\s+-[A-Za-z-]+)*\s+\S+|git\s+reset\s+--hard|git\s+checkout\s+--|sudo\s+|chmod\s+|chown\s+)(\s|$)/i;
 
 const SESSION_QUEUES = new Map();
 const CHAT_TO_CODEX_THREAD = new Map();
@@ -177,6 +184,15 @@ function json(res, status, payload) {
     "cache-control": "no-store",
   });
   res.end(JSON.stringify(payload));
+}
+
+function debugLog(tag, message, payload) {
+  if (!PROXY_DEBUG_VERBOSE) {
+    return;
+  }
+  const suffix =
+    payload === undefined ? "" : ` ${JSON.stringify(payload, null, 0).slice(0, 2000)}`;
+  process.stdout.write(`[debug] ${tag} ${message}${suffix}\n`);
 }
 
 function toBase64Url(input) {
@@ -245,6 +261,14 @@ function parseBearerToken(headers) {
     return "";
   }
   return auth.slice("Bearer ".length).trim();
+}
+
+function normalizeUserType(raw) {
+  return String(raw || "").trim().toLowerCase() === "guest" ? "guest" : "regular";
+}
+
+function isGuestUserType(userType) {
+  return normalizeUserType(userType) === "guest";
 }
 
 function hasUrl(text) {
@@ -699,11 +723,11 @@ function getLastUserText(messages) {
   return "";
 }
 
-function buildForcedPrompt(userText) {
+function buildForcedPrompt(userText, userType = "regular") {
   const rules = [];
 
   if (FORCE_CHINESE_OUTPUT) {
-    rules.push("你必须仅使用中文输出，禁止英文正文。");
+    rules.push("你必须仅使用中文输出（包含最终回答与 thinking/reasoning），禁止英文正文。");
   }
 
   if (FORCE_HTML_BACKTEST_CHART) {
@@ -717,9 +741,12 @@ function buildForcedPrompt(userText) {
     );
   }
 
-  if (FORCE_IMAGE_TAG) {
-    rules.push("最终回复中必须包含且只包含一次字面量标记：[Image #1]。");
+  if (isGuestUserType(userType)) {
+    rules.push(
+      "你当前处于访客安全模式：严禁执行敏感命令（例如 git push、rm、git reset --hard、git checkout --、sudo、chmod、chown），仅允许只读命令。"
+    );
   }
+
 
   if (rules.length === 0) {
     return userText;
@@ -734,6 +761,15 @@ function summarizeItemEvent(item) {
   }
 
   const itemType = typeof item.type === "string" ? item.type : "event";
+  const itemTypeLabelMap = {
+    reasoning: "思考",
+    command_execution: "命令执行",
+    file_change: "文件变更",
+    tool_call: "工具调用",
+    agent_message: "助手消息",
+    event: "事件",
+  };
+  const typeLabel = itemTypeLabelMap[itemType] || itemType;
   const details = [];
 
   for (const key of ["tool_name", "name", "command", "cmd", "description", "text"]) {
@@ -756,9 +792,9 @@ function summarizeItemEvent(item) {
   }
 
   if (details.length > 0) {
-    return `[${itemType}] ${details.join(" ")}`;
+    return `【${typeLabel}】 ${sanitizeReasoningText(details.join(" "))}`;
   }
-  return `[${itemType}]`;
+  return `【${typeLabel}】`;
 }
 
 function sanitizeReasoningText(text) {
@@ -779,16 +815,34 @@ function prettifyReasoningText(text) {
     return "";
   }
 
-  return sanitizeReasoningText(text)
+  const labelMap = {
+    command_execution: "命令执行",
+    file_change: "文件变更",
+    error: "错误",
+  };
+
+  const normalized = sanitizeReasoningText(text)
     .replace(/\r\n/g, "\n")
     .replace(/\*{3,}/g, "\n")
-    .replace(/(\S)\[(command_execution|file_change)\]/g, "$1\n[$2]")
-    .replace(/\[(command_execution|file_change)\]\s*/g, "[$1]\n")
     .replace(/\n{3,}/g, "\n\n")
     .trim();
+
+  if (!normalized) {
+    return "";
+  }
+
+  const lines = normalized
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .map((line) =>
+      line.replace(/\[(command_execution|file_change|error)\]/gi, (_, key) => `【${labelMap[key.toLowerCase()] || key}】`)
+    );
+
+  return lines.join("\n");
 }
 
-function formatCommandExecution(item) {
+function formatCommandExecution(item, { userType = "regular" } = {}) {
   const command = [
     item.command,
     item.cmd,
@@ -802,13 +856,17 @@ function formatCommandExecution(item) {
     if (/(\bpython\b.*-m\s+pip\s+install|\bpip3?\s+install)\b/i.test(trimmed)) {
       return "";
     }
-    return `[command_execution]\n${sanitizeReasoningText(trimmed)}`;
+    const cleaned = sanitizeReasoningText(trimmed);
+    if (isGuestUserType(userType) && GUEST_SENSITIVE_COMMAND_REGEX.test(trimmed)) {
+      return `【访客模式拦截】\n已拒绝敏感命令：${cleaned}`;
+    }
+    return `【命令执行】\n${cleaned}`;
   }
 
-  return "[command_execution]";
+  return "【命令执行】";
 }
 
-function extractCodexEventParts(obj) {
+function extractCodexEventParts(obj, { userType = "regular" } = {}) {
   const parts = {
     textDelta: "",
     reasoningDelta: "",
@@ -819,7 +877,7 @@ function extractCodexEventParts(obj) {
   }
 
   if (obj.type === "error" && typeof obj.message === "string") {
-    parts.reasoningDelta = `[error] ${sanitizeReasoningText(obj.message)}`;
+    parts.reasoningDelta = `【错误】 ${sanitizeReasoningText(obj.message)}`;
     return parts;
   }
 
@@ -837,7 +895,7 @@ function extractCodexEventParts(obj) {
     }
 
     if (item?.type === "command_execution") {
-      const formatted = formatCommandExecution(item);
+      const formatted = formatCommandExecution(item, { userType });
       if (formatted) {
         parts.reasoningDelta = formatted;
       }
@@ -886,12 +944,26 @@ function parseStructuredCodexError(raw) {
   return text;
 }
 
-function runCodex({ prompt, chatId, isNewSession, onTextChunk, onReasoningChunk }) {
+function runCodex({
+  prompt,
+  chatId,
+  isNewSession,
+  onTextChunk,
+  onReasoningChunk,
+  traceTag = "",
+  userType = "regular",
+}) {
   return new Promise((resolve, reject) => {
+    const normalizedUserType = normalizeUserType(userType);
+    const guestMode = isGuestUserType(normalizedUserType);
     const codexConfigArgs = getCodexConfigArgs();
     let args = ["exec", "--json", "--skip-git-repo-check"];
 
-    if (CODEX_SKIP_APPROVALS) {
+    if (guestMode) {
+      args.push("--sandbox", "read-only");
+    }
+
+    if (CODEX_SKIP_APPROVALS && !guestMode) {
       args.push("--dangerously-bypass-approvals-and-sandbox");
     }
 
@@ -911,9 +983,10 @@ function runCodex({ prompt, chatId, isNewSession, onTextChunk, onReasoningChunk 
         "resume",
         "--json",
         "--skip-git-repo-check",
+        ...(guestMode ? ["--sandbox", "read-only"] : []),
         ...(CODEX_EPHEMERAL ? ["--ephemeral"] : []),
         ...codexConfigArgs,
-        ...(CODEX_SKIP_APPROVALS
+        ...(CODEX_SKIP_APPROVALS && !guestMode
           ? ["--dangerously-bypass-approvals-and-sandbox"]
           : []),
         ...(CODEX_MODEL ? ["--model", CODEX_MODEL] : []),
@@ -928,6 +1001,9 @@ function runCodex({ prompt, chatId, isNewSession, onTextChunk, onReasoningChunk 
     if (CODEX_RUST_LOG && !childEnv.RUST_LOG) {
       childEnv.RUST_LOG = CODEX_RUST_LOG;
     }
+    if (CODEX_CONFIG_PATH && fs.existsSync(CODEX_CONFIG_PATH)) {
+      childEnv.CODEX_HOME = CODEX_CONFIG_HOME;
+    }
     const venvBin = path.resolve(REPO_ROOT, ".venv", "bin");
     if (fs.existsSync(venvBin)) {
       childEnv.VIRTUAL_ENV = path.resolve(REPO_ROOT, ".venv");
@@ -939,11 +1015,25 @@ function runCodex({ prompt, chatId, isNewSession, onTextChunk, onReasoningChunk 
       stdio: ["ignore", "pipe", "pipe"],
     });
 
+    debugLog(traceTag, "spawn_codex", {
+      chatId,
+      userType: normalizedUserType,
+      guestMode,
+      isNewSession,
+      knownThreadId: knownThreadId || "",
+      args,
+      configPath: CODEX_CONFIG_PATH,
+      promptLength: String(prompt || "").length,
+    });
+
     let stdoutBuffer = "";
     let stderrText = "";
     let fullText = "";
     let threadId = knownThreadId;
     let codexError = "";
+    let eventCount = 0;
+    let textDeltaCount = 0;
+    let reasoningDeltaCount = 0;
 
     child.stdout.on("data", (chunk) => {
       const text = chunk.toString("utf8");
@@ -960,27 +1050,43 @@ function runCodex({ prompt, chatId, isNewSession, onTextChunk, onReasoningChunk 
 
         try {
           const obj = JSON.parse(trimmed);
+          eventCount += 1;
           if (obj.type === "thread.started" && typeof obj.thread_id === "string") {
             threadId = obj.thread_id;
+            debugLog(traceTag, "thread_started", { threadId });
           }
           if (obj.type === "error" && typeof obj.message === "string") {
             codexError = parseStructuredCodexError(obj.message);
+            debugLog(traceTag, "codex_error_event", { message: codexError });
           }
           if (obj.type === "turn.failed" && typeof obj?.error?.message === "string") {
             codexError = parseStructuredCodexError(obj.error.message);
+            debugLog(traceTag, "codex_turn_failed", { message: codexError });
           }
 
-          const { textDelta, reasoningDelta } = extractCodexEventParts(obj);
+          const { textDelta, reasoningDelta } = extractCodexEventParts(obj, {
+            userType: normalizedUserType,
+          });
           if (reasoningDelta) {
+            reasoningDeltaCount += 1;
             onReasoningChunk?.(reasoningDelta);
           }
 
           if (textDelta) {
+            textDeltaCount += 1;
             if (fullText) {
               fullText += "\n";
             }
             fullText += textDelta;
             onTextChunk?.(textDelta);
+          }
+
+          if (obj?.run_id || String(obj?.id || "").startsWith("run_")) {
+            debugLog(traceTag, "run_event", {
+              type: obj.type || "",
+              id: obj.id || "",
+              run_id: obj.run_id || "",
+            });
           }
         } catch {
           // ignore non-JSON logs from Codex CLI
@@ -1009,7 +1115,9 @@ function runCodex({ prompt, chatId, isNewSession, onTextChunk, onReasoningChunk 
           if (obj.type === "turn.failed" && typeof obj?.error?.message === "string") {
             codexError = parseStructuredCodexError(obj.error.message);
           }
-          const { textDelta, reasoningDelta } = extractCodexEventParts(obj);
+          const { textDelta, reasoningDelta } = extractCodexEventParts(obj, {
+            userType: normalizedUserType,
+          });
           if (reasoningDelta) {
             onReasoningChunk?.(reasoningDelta);
           }
@@ -1027,10 +1135,25 @@ function runCodex({ prompt, chatId, isNewSession, onTextChunk, onReasoningChunk 
       if (code !== 0) {
         const cleanedStderr = stripRolloutNoise(stderrText);
         const message = codexError || cleanedStderr || `codex exited with code ${code}`;
+        debugLog(traceTag, "codex_close_error", {
+          code,
+          message,
+          eventCount,
+          textDeltaCount,
+          reasoningDeltaCount,
+        });
         reject(new Error(message));
         return;
       }
 
+      debugLog(traceTag, "codex_close_ok", {
+        code,
+        threadId: threadId || "",
+        eventCount,
+        textDeltaCount,
+        reasoningDeltaCount,
+        textLength: fullText.trim().length,
+      });
       resolve({ text: fullText.trim(), stderr: stderrText, threadId });
     });
   });
@@ -1052,7 +1175,15 @@ function enqueueBySession(sessionId, task) {
   return next;
 }
 
-function runCodexWithFallback({ prompt, chatId, isNewSession, onTextChunk, onReasoningChunk }) {
+function runCodexWithFallback({
+  prompt,
+  chatId,
+  isNewSession,
+  onTextChunk,
+  onReasoningChunk,
+  traceTag = "",
+  userType = "regular",
+}) {
   return enqueueBySession(chatId, async () => {
     try {
       const result = await runCodex({
@@ -1061,6 +1192,8 @@ function runCodexWithFallback({ prompt, chatId, isNewSession, onTextChunk, onRea
         isNewSession,
         onTextChunk,
         onReasoningChunk,
+        traceTag,
+        userType,
       });
       if (result.threadId) {
         CHAT_TO_CODEX_THREAD.set(chatId, result.threadId);
@@ -1081,6 +1214,8 @@ function runCodexWithFallback({ prompt, chatId, isNewSession, onTextChunk, onRea
           isNewSession: true,
           onTextChunk,
           onReasoningChunk,
+          traceTag,
+          userType,
         });
         if (retried.threadId) {
           CHAT_TO_CODEX_THREAD.set(chatId, retried.threadId);
@@ -1161,6 +1296,7 @@ const server = http.createServer(async (req, res) => {
 
   try {
     const url = new URL(req.url || "/", `http://${HOST}:${PORT}`);
+    const traceTag = `req=${reqId}`;
 
     if (req.method === "GET" && url.pathname === "/healthz") {
       decision = "healthz";
@@ -1238,6 +1374,12 @@ const server = http.createServer(async (req, res) => {
     let body;
     try {
       body = JSON.parse(rawBody);
+      debugLog(traceTag, "request_body_parsed", {
+        path: url.pathname,
+        method: req.method,
+        bodyKeys: Object.keys(body || {}),
+        rawBodyLength: rawBody.length,
+      });
     } catch {
       decision = "invalid_json";
       return json(res, 400, { error: { message: "Invalid JSON body" } });
@@ -1245,6 +1387,7 @@ const server = http.createServer(async (req, res) => {
 
     const model = body.model || CODEX_MODEL;
     const stream = Boolean(body.stream);
+    const userType = normalizeUserType(req.headers["x-user-type"]);
     const explicitText =
       typeof body?.text === "string"
         ? body.text
@@ -1253,6 +1396,17 @@ const server = http.createServer(async (req, res) => {
           : "";
     const userText = explicitText.trim() || getLastUserText(body.messages);
     inputPreview = previewText(userText);
+    debugLog(traceTag, "request_core_fields", {
+      isPolicyCheck,
+      isChatCompletions,
+      stream,
+      model,
+      userTextLength: userText.length,
+      xChatId: String(req.headers["x-chat-id"] || ""),
+      xChatNew: String(req.headers["x-chat-new"] || ""),
+      xUserType: userType,
+      turnstileHeaderPresent: Boolean(String(req.headers[TURNSTILE_TOKEN_HEADER] || "").trim()),
+    });
 
     if (!userText) {
       decision = "no_user_message";
@@ -1272,13 +1426,17 @@ const server = http.createServer(async (req, res) => {
 
     const internalKey = String(req.headers["x-internal-task-key"] || "").trim();
     const trustedInternal = INTERNAL_TASK_KEY && internalKey === INTERNAL_TASK_KEY;
-    const bypassTurnstile = !isPolicyCheck && trustedInternal;
+    const bypassTurnstile = isPolicyCheck || trustedInternal;
     const bypassPolicy =
       !isPolicyCheck &&
       trustedInternal &&
       String(req.headers["x-policy-prechecked"] || "").trim() === "1";
     if (!bypassTurnstile) {
       const turnstileToken = getRequestTurnstileToken(req, body);
+      debugLog(traceTag, "turnstile_verify_start", {
+        tokenLength: turnstileToken.length,
+        bypassTurnstile,
+      });
       const turnstile = await verifyTurnstile({ token: turnstileToken, ip: clientIp });
       if (!turnstile.ok) {
         decision = `turnstile_${turnstile.reason}`;
@@ -1298,6 +1456,7 @@ const server = http.createServer(async (req, res) => {
               }
         );
       }
+      debugLog(traceTag, "turnstile_verify_ok", { reason: turnstile.reason });
     }
 
     if (BLOCK_URL_INPUT && hasUrl(userText)) {
@@ -1340,6 +1499,7 @@ const server = http.createServer(async (req, res) => {
 
     if (isPolicyCheck) {
       decision = bypassPolicy ? "policy_check_ok_bypassed" : "policy_check_ok";
+      debugLog(traceTag, "policy_check_return", { bypassPolicy, decision });
       return json(res, 200, {
         allowed: true,
         reason: "ok",
@@ -1349,15 +1509,17 @@ const server = http.createServer(async (req, res) => {
 
     const sessionId = String(req.headers["x-chat-id"] || randomUUID());
     const isNewSession = String(req.headers["x-chat-new"] || "false") === "true";
-    const finalPrompt = buildForcedPrompt(userText);
+    const finalPrompt = buildForcedPrompt(userText, userType);
     const requestCacheKey = cacheKey({ model, prompt: finalPrompt });
     const canUseCache = CACHE_ENABLED && isNewSession;
     if (canUseCache) {
       const cachedContent = readCache(requestCacheKey);
       if (cachedContent) {
         decision = "cache_hit";
+        debugLog(traceTag, "cache_hit", { cacheKey: requestCacheKey, contentLength: cachedContent.length });
         return respondWithFixedReply({ res, stream, model, reply: cachedContent });
       }
+      debugLog(traceTag, "cache_miss", { cacheKey: requestCacheKey });
     }
 
     if (stream) {
@@ -1373,6 +1535,8 @@ const server = http.createServer(async (req, res) => {
         prompt: finalPrompt,
         chatId: sessionId,
         isNewSession,
+        userType,
+        traceTag,
         onTextChunk: (chunk) => {
           rawAccumulated += chunk;
           const redacted = redactSensitive(rawAccumulated);
@@ -1396,6 +1560,10 @@ const server = http.createServer(async (req, res) => {
       });
 
       writeOpenAiSseChunk(res, createDoneChunk({ id, model }));
+      debugLog(traceTag, "stream_done", {
+        emittedLength,
+        emittedReasoningLength,
+      });
       return writeOpenAiSseDone(res);
     }
 
@@ -1403,6 +1571,8 @@ const server = http.createServer(async (req, res) => {
       prompt: finalPrompt,
       chatId: sessionId,
       isNewSession,
+      userType,
+      traceTag,
     });
 
     const content = redactSensitive(result.text);
@@ -1410,6 +1580,11 @@ const server = http.createServer(async (req, res) => {
       writeCache(requestCacheKey, content);
     }
     decision = canUseCache ? "ok_json_cache_write" : "ok_json";
+    debugLog(traceTag, "json_done", {
+      decision,
+      contentLength: content.length,
+      threadId: result.threadId || "",
+    });
 
     return json(res, 200, {
       id: `chatcmpl-${randomUUID()}`,
