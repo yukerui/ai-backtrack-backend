@@ -1,0 +1,14 @@
+# Dependencies
+node_modules/
+
+# Runtime files
+.runtime/
+
+# Generated artifacts
+artifacts/
+
+# Local environment and secrets
+.env
+.env.local
+.env.*.local
+config/
