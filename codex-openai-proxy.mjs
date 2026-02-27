@@ -155,6 +155,15 @@ const CODEX_REASONING_EFFORT = (
 )
   .toLowerCase()
   .trim();
+const CODEX_HIDE_AGENT_REASONING =
+  (process.env.CODEX_HIDE_AGENT_REASONING || "false").toLowerCase() === "true";
+const CODEX_SHOW_RAW_AGENT_REASONING =
+  (process.env.CODEX_SHOW_RAW_AGENT_REASONING || "false").toLowerCase() === "true";
+const CODEX_MODEL_REASONING_SUMMARY = (
+  process.env.CODEX_MODEL_REASONING_SUMMARY || process.env.MODEL_REASONING_SUMMARY || ""
+)
+  .toLowerCase()
+  .trim();
 const CODEX_RUST_LOG = (
   process.env.CODEX_RUST_LOG || "error,codex_core::rollout::list=off"
 ).trim();
@@ -797,6 +806,10 @@ function summarizeItemEvent(item) {
     command_execution: "命令执行",
     file_change: "文件变更",
     tool_call: "工具调用",
+    tool_result: "工具结果",
+    web_search: "网页检索",
+    plan_update: "计划更新",
+    plan: "计划更新",
     agent_message: "助手消息",
     event: "事件",
   };
@@ -982,6 +995,40 @@ function formatCommandExecution(item, { userType = "regular" } = {}) {
   return "【命令执行】";
 }
 
+function extractReasoningTextFromItem(item) {
+  if (!item || typeof item !== "object") {
+    return "";
+  }
+
+  const fields = [];
+  if (typeof item.text === "string" && item.text.trim()) {
+    fields.push(item.text.trim());
+  }
+  if (typeof item.reasoning === "string" && item.reasoning.trim()) {
+    fields.push(item.reasoning.trim());
+  }
+  if (typeof item.summary === "string" && item.summary.trim()) {
+    fields.push(item.summary.trim());
+  }
+  if (typeof item.description === "string" && item.description.trim()) {
+    fields.push(item.description.trim());
+  }
+  if (typeof item.message === "string" && item.message.trim()) {
+    fields.push(item.message.trim());
+  }
+
+  const contentText = extractTextFromMessageContent(item.content);
+  if (contentText.trim()) {
+    fields.push(contentText.trim());
+  }
+
+  if (fields.length === 0) {
+    return "";
+  }
+
+  return sanitizeReasoningText(fields.join("\n")).trim();
+}
+
 function extractCodexEventParts(obj, { userType = "regular" } = {}) {
   const parts = {
     textDelta: "",
@@ -997,31 +1044,64 @@ function extractCodexEventParts(obj, { userType = "regular" } = {}) {
     return parts;
   }
 
-  // Keep reasoning cleaner: only consume completed events to avoid noisy duplicates.
-  if (obj.type === "item.completed") {
-    const item = obj.item;
-    if (item?.type === "agent_message" && typeof item.text === "string") {
-      parts.textDelta = item.text;
+  const eventType = typeof obj.type === "string" ? obj.type : "";
+  if (!eventType.startsWith("item.")) {
+    return parts;
+  }
+
+  const item = obj.item;
+  if (!item || typeof item !== "object") {
+    return parts;
+  }
+
+  const itemType = typeof item.type === "string" ? item.type : "event";
+  if (eventType === "item.completed" && itemType === "agent_message" && typeof item.text === "string") {
+    parts.textDelta = item.text;
+  }
+
+  if (CODEX_HIDE_AGENT_REASONING) {
+    return parts;
+  }
+
+  if (itemType === "reasoning") {
+    const rawReasoning = extractReasoningTextFromItem(item);
+    if (rawReasoning) {
+      parts.reasoningDelta = CODEX_SHOW_RAW_AGENT_REASONING
+        ? rawReasoning
+        : prettifyReasoningText(rawReasoning);
       return parts;
     }
-
-    if (item?.type === "reasoning" && typeof item.text === "string") {
-      parts.reasoningDelta = prettifyReasoningText(item.text);
-      return parts;
-    }
-
-    if (item?.type === "command_execution") {
-      const formatted = formatCommandExecution(item, { userType });
-      if (formatted) {
-        parts.reasoningDelta = formatted;
-      }
-      return parts;
-    }
-
-    if (item?.type === "file_change") {
-      parts.reasoningDelta = prettifyReasoningText(summarizeItemEvent(item));
+    const fallbackSummary = summarizeItemEvent(item);
+    if (fallbackSummary) {
+      parts.reasoningDelta = prettifyReasoningText(fallbackSummary);
     }
     return parts;
+  }
+
+  if (itemType === "command_execution") {
+    const formatted = formatCommandExecution(item, { userType });
+    if (formatted) {
+      parts.reasoningDelta = CODEX_SHOW_RAW_AGENT_REASONING
+        ? sanitizeReasoningText(formatted)
+        : formatted;
+    }
+    return parts;
+  }
+
+  if (
+    itemType === "file_change" ||
+    itemType === "tool_call" ||
+    itemType === "tool_result" ||
+    itemType === "web_search" ||
+    itemType === "plan_update" ||
+    itemType === "plan"
+  ) {
+    const summary = summarizeItemEvent(item);
+    if (summary) {
+      parts.reasoningDelta = CODEX_SHOW_RAW_AGENT_REASONING
+        ? sanitizeReasoningText(summary)
+        : prettifyReasoningText(summary);
+    }
   }
 
   return parts;
@@ -1031,6 +1111,14 @@ function getCodexConfigArgs() {
   const args = [];
   if (CODEX_REASONING_EFFORT) {
     args.push("-c", `model_reasoning_effort="${CODEX_REASONING_EFFORT}"`);
+  }
+  args.push("-c", `hide_agent_reasoning=${CODEX_HIDE_AGENT_REASONING ? "true" : "false"}`);
+  args.push(
+    "-c",
+    `show_raw_agent_reasoning=${CODEX_SHOW_RAW_AGENT_REASONING ? "true" : "false"}`
+  );
+  if (CODEX_MODEL_REASONING_SUMMARY) {
+    args.push("-c", `model_reasoning_summary="${CODEX_MODEL_REASONING_SUMMARY}"`);
   }
   return args;
 }
