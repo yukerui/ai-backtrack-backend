@@ -1421,13 +1421,28 @@ const server = http.createServer(async (req, res) => {
   let decision = "pending";
   let clientIp = "-";
   let inputPreview = "";
+  let accessLogged = false;
 
-  res.on("finish", () => {
+  const logAccess = (prefix, suffix = "") => {
+    if (accessLogged) {
+      return;
+    }
+    accessLogged = true;
     const ms = Date.now() - startedAt;
     const preview = inputPreview ? ` q="${inputPreview}"` : "";
     process.stdout.write(
-      `[access] id=${reqId} ip=${clientIp} ${req.method || "-"} ${req.url || "-"} status=${res.statusCode} ms=${ms} decision=${decision}${preview}\n`
+      `[${prefix}] id=${reqId} ip=${clientIp} ${req.method || "-"} ${req.url || "-"} status=${res.statusCode} ms=${ms} decision=${decision}${suffix}${preview}\n`
     );
+  };
+
+  res.on("finish", () => {
+    logAccess("access");
+  });
+
+  res.on("close", () => {
+    if (!res.writableEnded) {
+      logAccess("access-close", ":connection_closed_before_finish");
+    }
   });
 
   try {
