@@ -155,12 +155,8 @@ const CODEX_REASONING_EFFORT = (
 )
   .toLowerCase()
   .trim();
-const CODEX_HIDE_AGENT_REASONING =
-  (process.env.CODEX_HIDE_AGENT_REASONING || "false").toLowerCase() === "true";
-const CODEX_SHOW_RAW_AGENT_REASONING =
-  (process.env.CODEX_SHOW_RAW_AGENT_REASONING || "false").toLowerCase() === "true";
 const CODEX_MODEL_REASONING_SUMMARY = (
-  process.env.CODEX_MODEL_REASONING_SUMMARY || process.env.MODEL_REASONING_SUMMARY || ""
+  process.env.CODEX_MODEL_REASONING_SUMMARY || process.env.MODEL_REASONING_SUMMARY || "concise"
 )
   .toLowerCase()
   .trim();
@@ -800,20 +796,6 @@ function summarizeItemEvent(item) {
     return "";
   }
 
-  const itemType = typeof item.type === "string" ? item.type : "event";
-  const itemTypeLabelMap = {
-    reasoning: "思考",
-    command_execution: "命令执行",
-    file_change: "文件变更",
-    tool_call: "工具调用",
-    tool_result: "工具结果",
-    web_search: "网页检索",
-    plan_update: "计划更新",
-    plan: "计划更新",
-    agent_message: "助手消息",
-    event: "事件",
-  };
-  const typeLabel = itemTypeLabelMap[itemType] || itemType;
   const details = [];
 
   for (const key of ["tool_name", "name", "command", "cmd", "description", "text"]) {
@@ -836,9 +818,9 @@ function summarizeItemEvent(item) {
   }
 
   if (details.length > 0) {
-    return `【${typeLabel}】 ${sanitizeReasoningText(details.join(" "))}`;
+    return sanitizeReasoningText(details.join(" "));
   }
-  return `【${typeLabel}】`;
+  return "";
 }
 
 function sanitizeReasoningText(text) {
@@ -987,12 +969,12 @@ function formatCommandExecution(item, { userType = "regular" } = {}) {
       return "";
     }
     if (isGuestUserType(userType) && GUEST_SENSITIVE_COMMAND_REGEX.test(trimmed)) {
-      return `【访客模式拦截】\n已拒绝敏感命令：${summarized}`;
+      return `已拒绝敏感命令：${summarized}`;
     }
-    return `【命令执行】\n${summarized}`;
+    return summarized;
   }
 
-  return "【命令执行】";
+  return "";
 }
 
 function extractReasoningTextFromItem(item) {
@@ -1059,16 +1041,10 @@ function extractCodexEventParts(obj, { userType = "regular" } = {}) {
     parts.textDelta = item.text;
   }
 
-  if (CODEX_HIDE_AGENT_REASONING) {
-    return parts;
-  }
-
   if (itemType === "reasoning") {
     const rawReasoning = extractReasoningTextFromItem(item);
     if (rawReasoning) {
-      parts.reasoningDelta = CODEX_SHOW_RAW_AGENT_REASONING
-        ? rawReasoning
-        : prettifyReasoningText(rawReasoning);
+      parts.reasoningDelta = prettifyReasoningText(rawReasoning);
       return parts;
     }
     const fallbackSummary = summarizeItemEvent(item);
@@ -1081,9 +1057,7 @@ function extractCodexEventParts(obj, { userType = "regular" } = {}) {
   if (itemType === "command_execution") {
     const formatted = formatCommandExecution(item, { userType });
     if (formatted) {
-      parts.reasoningDelta = CODEX_SHOW_RAW_AGENT_REASONING
-        ? sanitizeReasoningText(formatted)
-        : formatted;
+      parts.reasoningDelta = formatted;
     }
     return parts;
   }
@@ -1098,9 +1072,7 @@ function extractCodexEventParts(obj, { userType = "regular" } = {}) {
   ) {
     const summary = summarizeItemEvent(item);
     if (summary) {
-      parts.reasoningDelta = CODEX_SHOW_RAW_AGENT_REASONING
-        ? sanitizeReasoningText(summary)
-        : prettifyReasoningText(summary);
+      parts.reasoningDelta = prettifyReasoningText(summary);
     }
   }
 
@@ -1112,11 +1084,6 @@ function getCodexConfigArgs() {
   if (CODEX_REASONING_EFFORT) {
     args.push("-c", `model_reasoning_effort="${CODEX_REASONING_EFFORT}"`);
   }
-  args.push("-c", `hide_agent_reasoning=${CODEX_HIDE_AGENT_REASONING ? "true" : "false"}`);
-  args.push(
-    "-c",
-    `show_raw_agent_reasoning=${CODEX_SHOW_RAW_AGENT_REASONING ? "true" : "false"}`
-  );
   if (CODEX_MODEL_REASONING_SUMMARY) {
     args.push("-c", `model_reasoning_summary="${CODEX_MODEL_REASONING_SUMMARY}"`);
   }
