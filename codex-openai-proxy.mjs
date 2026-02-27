@@ -765,10 +765,9 @@ function buildForcedPrompt(userText, userType = "regular") {
   if (FORCE_HTML_BACKTEST_CHART) {
     rules.push(
       [
-        "你必须生成一个 HTML 交互图表文件，路径使用 artifacts/*.html。",
-        "HTML 必须包含 <html>、<head>、<body>，并包含 <div id=\"backtestChart\"></div> 与内联 <script> 绘图。",
-        "如果用户未提供完整回测数据，也要生成可运行示例曲线，并在页面中标注“示例数据，仅用于展示”。",
+        "涉及回测/走势图时，优先输出 Plotly 可渲染 JSON（包含 data、layout、config），并使用 ```plotly-json ... ``` 代码块包裹。",
         "最终文字回复只输出简要结论，不要输出下载提示或 markdown 链接。",
+        "除非用户明确要求导出文件，否则不要生成 artifacts/*.html。",
       ].join("")
     );
   }
