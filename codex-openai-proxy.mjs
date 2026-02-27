@@ -177,6 +177,7 @@ const GUEST_SENSITIVE_COMMAND_REGEX =
 
 const SESSION_QUEUES = new Map();
 const CHAT_TO_CODEX_THREAD = new Map();
+const CHAT_TO_USER_TYPE = new Map();
 const RATE_LIMIT_BUCKETS = new Map();
 const RESPONSE_CACHE = new Map();
 
@@ -265,12 +266,41 @@ function parseBearerToken(headers) {
   return auth.slice("Bearer ".length).trim();
 }
 
-function normalizeUserType(raw) {
-  return String(raw || "").trim().toLowerCase() === "guest" ? "guest" : "regular";
+function normalizeUserType(raw, fallback = "guest") {
+  const value = String(raw || "").trim().toLowerCase();
+  if (value === "guest") {
+    return "guest";
+  }
+  if (value === "regular") {
+    return "regular";
+  }
+  return fallback === "regular" ? "regular" : "guest";
 }
 
 function isGuestUserType(userType) {
-  return normalizeUserType(userType) === "guest";
+  return normalizeUserType(userType, "guest") === "guest";
+}
+
+function resolveUserTypeForChat(chatId, requestedUserType) {
+  const normalizedRequested = normalizeUserType(requestedUserType, "guest");
+  const key = String(chatId || "").trim();
+  if (!key) {
+    return normalizedRequested;
+  }
+
+  const known = CHAT_TO_USER_TYPE.get(key);
+  if (!known) {
+    CHAT_TO_USER_TYPE.set(key, normalizedRequested);
+    return normalizedRequested;
+  }
+
+  // Security: never escalate privileges within the same chat id.
+  const effective =
+    known === "guest" || normalizedRequested === "guest" ? "guest" : "regular";
+  if (effective !== known) {
+    CHAT_TO_USER_TYPE.set(key, effective);
+  }
+  return effective;
 }
 
 function hasUrl(text) {
@@ -1163,7 +1193,7 @@ function runCodex({
             if (normalizedReasoning && normalizedReasoning !== lastReasoningDelta) {
               reasoningDeltaCount += 1;
               lastReasoningDelta = normalizedReasoning;
-              onReasoningChunk?.(normalizedReasoning);
+              onReasoningChunk?.(`${normalizedReasoning}\n`);
             }
           }
 
@@ -1219,7 +1249,7 @@ function runCodex({
             const normalizedReasoning = reasoningDelta.trim();
             if (normalizedReasoning && normalizedReasoning !== lastReasoningDelta) {
               lastReasoningDelta = normalizedReasoning;
-              onReasoningChunk?.(normalizedReasoning);
+              onReasoningChunk?.(`${normalizedReasoning}\n`);
             }
           }
           if (textDelta) {
@@ -1494,7 +1524,10 @@ const server = http.createServer(async (req, res) => {
 
     const model = body.model || CODEX_MODEL;
     const stream = Boolean(body.stream);
-    const userType = normalizeUserType(req.headers["x-user-type"]);
+    const chatIdHeader = String(req.headers["x-chat-id"] || "").trim();
+    const xChatNew = String(req.headers["x-chat-new"] || "").trim();
+    const requestedUserType = normalizeUserType(req.headers["x-user-type"], "guest");
+    const userType = resolveUserTypeForChat(chatIdHeader, requestedUserType);
     const explicitText =
       typeof body?.text === "string"
         ? body.text
@@ -1509,11 +1542,17 @@ const server = http.createServer(async (req, res) => {
       stream,
       model,
       userTextLength: userText.length,
-      xChatId: String(req.headers["x-chat-id"] || ""),
-      xChatNew: String(req.headers["x-chat-new"] || ""),
+      xChatId: chatIdHeader,
+      xChatNew,
+      xUserTypeRequested: requestedUserType,
       xUserType: userType,
       turnstileHeaderPresent: Boolean(String(req.headers[TURNSTILE_TOKEN_HEADER] || "").trim()),
     });
+    if (requestedUserType !== userType) {
+      process.stdout.write(
+        `[security] user_type_downgraded chatId=${chatIdHeader || "-"} requested=${requestedUserType} effective=${userType}\n`
+      );
+    }
 
     if (!userText) {
       decision = "no_user_message";
@@ -1614,8 +1653,8 @@ const server = http.createServer(async (req, res) => {
       });
     }
 
-    const sessionId = String(req.headers["x-chat-id"] || randomUUID());
-    const isNewSession = String(req.headers["x-chat-new"] || "false") === "true";
+    const sessionId = chatIdHeader || randomUUID();
+    const isNewSession = xChatNew === "true";
     const finalPrompt = buildForcedPrompt(userText, userType);
     const requestCacheKey = cacheKey({ model, prompt: finalPrompt });
     const canUseCache = CACHE_ENABLED && isNewSession;
