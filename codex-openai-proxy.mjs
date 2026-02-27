@@ -765,10 +765,10 @@ function buildForcedPrompt(userText, userType = "regular") {
   if (FORCE_HTML_BACKTEST_CHART) {
     rules.push(
       [
-        "你必须生成一个可下载的 HTML 交互图表文件，路径使用 artifacts/*.html。",
+        "你必须生成一个 HTML 交互图表文件，路径使用 artifacts/*.html。",
         "HTML 必须包含 <html>、<head>、<body>，并包含 <div id=\"backtestChart\"></div> 与内联 <script> 绘图。",
         "如果用户未提供完整回测数据，也要生成可运行示例曲线，并在页面中标注“示例数据，仅用于展示”。",
-        "最终文字回复中必须包含该 HTML 文件的下载/打开链接（例如 artifacts/xxx.html）。",
+        "最终文字回复只输出简要结论，不要输出下载提示或 markdown 链接。",
       ].join("")
     );
   }
