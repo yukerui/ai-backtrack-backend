@@ -160,6 +160,8 @@ const CODEX_MODEL_REASONING_SUMMARY = (
 )
   .toLowerCase()
   .trim();
+const CODEX_GUEST_ENABLE_WEB_SEARCH =
+  (process.env.CODEX_GUEST_ENABLE_WEB_SEARCH || "false").toLowerCase() === "true";
 const CODEX_RUST_LOG = (
   process.env.CODEX_RUST_LOG || "error,codex_core::rollout::list=off"
 ).trim();
@@ -1134,6 +1136,9 @@ function runCodex({
 
     if (guestMode) {
       args.push("--sandbox", "read-only");
+      if (CODEX_GUEST_ENABLE_WEB_SEARCH) {
+        args.push("--enable", "web_search");
+      }
     }
 
     if (CODEX_SKIP_APPROVALS && !guestMode) {
@@ -1157,6 +1162,7 @@ function runCodex({
         "--json",
         "--skip-git-repo-check",
         ...(guestMode ? ["--sandbox", "read-only"] : []),
+        ...(guestMode && CODEX_GUEST_ENABLE_WEB_SEARCH ? ["--enable", "web_search"] : []),
         ...(CODEX_EPHEMERAL ? ["--ephemeral"] : []),
         ...codexConfigArgs,
         ...(CODEX_SKIP_APPROVALS && !guestMode
@@ -1192,6 +1198,7 @@ function runCodex({
       chatId,
       userType: normalizedUserType,
       guestMode,
+      guestWebSearchEnabled: guestMode && CODEX_GUEST_ENABLE_WEB_SEARCH,
       isNewSession,
       knownThreadId: knownThreadId || "",
       args,
