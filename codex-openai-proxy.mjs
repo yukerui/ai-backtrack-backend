@@ -68,8 +68,6 @@ const BLOCK_POLITICAL_INPUT =
   (process.env.BLOCK_POLITICAL_INPUT || "true").toLowerCase() !== "false";
 const BLOCK_ADULT_INPUT =
   (process.env.BLOCK_ADULT_INPUT || "true").toLowerCase() !== "false";
-const FORCE_CHINESE_OUTPUT =
-  (process.env.FORCE_CHINESE_OUTPUT || "true").toLowerCase() !== "false";
 const FORCE_HTML_BACKTEST_CHART =
   (process.env.FORCE_HTML_BACKTEST_CHART || "true").toLowerCase() !== "false";
 const TURNSTILE_ENABLED =
@@ -156,12 +154,28 @@ const CODEX_REASONING_EFFORT = (
   .toLowerCase()
   .trim();
 const CODEX_MODEL_REASONING_SUMMARY = (
-  process.env.CODEX_MODEL_REASONING_SUMMARY || process.env.MODEL_REASONING_SUMMARY || "concise"
+  process.env.CODEX_MODEL_REASONING_SUMMARY || process.env.MODEL_REASONING_SUMMARY || "detailed"
 )
   .toLowerCase()
   .trim();
+const CODEX_GUEST_SANDBOX_MODE_RAW = (
+  process.env.CODEX_GUEST_SANDBOX_MODE || "workspace-write"
+)
+  .toLowerCase()
+  .trim();
+const CODEX_GUEST_SANDBOX_MODE = ["read-only", "workspace-write", "danger-full-access"].includes(
+  CODEX_GUEST_SANDBOX_MODE_RAW
+)
+  ? CODEX_GUEST_SANDBOX_MODE_RAW
+  : "workspace-write";
 const CODEX_GUEST_ENABLE_WEB_SEARCH =
   (process.env.CODEX_GUEST_ENABLE_WEB_SEARCH || "false").toLowerCase() === "true";
+const CODEX_GUEST_DANGEROUS =
+  (
+    process.env.CODEX_GUEST_DANGEROUS ||
+    process.env.CODEX_GUEST_DANGEROUSLY_BYPASS_APPROVALS_AND_SANDBOX ||
+    "true"
+  ).toLowerCase() === "true";
 const CODEX_RUST_LOG = (
   process.env.CODEX_RUST_LOG || "error,codex_core::rollout::list=off"
 ).trim();
@@ -180,7 +194,7 @@ const BACKTEST_KEYWORD_REGEX =
 const CAPABILITY_QUERY_REGEX =
   /(你能做什么|你有哪些功能|你会什么|怎么用|功能清单|能力清单|可用功能|help|capabilities)/i;
 const GUEST_SENSITIVE_COMMAND_REGEX =
-  /(^|[;&|]\s*)(git\s+push|rm(\s+-[A-Za-z-]+)*\s+\S+|git\s+reset\s+--hard|git\s+checkout\s+--|sudo\s+|chmod\s+|chown\s+)(\s|$)/i;
+  /(^|[;&|]\s*)(git\s+push|rm(\s+-[A-Za-z-]+)*\s+\S+|git\s+reset\s+--hard|git\s+checkout\s+--|sudo\s+|chmod\s+|chown\s+|printenv(\s|$)|env(\s|$)|set(\s|$)|export\s+|cat\s+\.env(\.[A-Za-z0-9_-]+)?(\s|$)|cat\s+\/proc\/[0-9]+\/environ(\s|$))(\s|$)/i;
 
 const SESSION_QUEUES = new Map();
 const CHAT_TO_CODEX_THREAD = new Map();
@@ -765,10 +779,6 @@ function getLastUserText(messages) {
 function buildForcedPrompt(userText, userType = "regular") {
   const rules = [];
 
-  if (FORCE_CHINESE_OUTPUT) {
-    rules.push("你必须仅使用中文输出（包含最终回答与 thinking/reasoning），禁止英文正文。");
-  }
-
   if (FORCE_HTML_BACKTEST_CHART) {
     rules.push(
       [
@@ -781,7 +791,7 @@ function buildForcedPrompt(userText, userType = "regular") {
 
   if (isGuestUserType(userType)) {
     rules.push(
-      "你当前处于访客安全模式：严禁执行敏感命令（例如 git push、rm、git reset --hard、git checkout --、sudo、chmod、chown），仅允许只读命令。"
+      "允许使用高权限执行，但严禁执行 rm 等删除类命令；严禁读取、输出、回显、上传环境变量或密钥（例如 env、printenv、set、export、cat .env、/proc/*/environ 及任何 *_KEY/*_TOKEN/*_SECRET）。"
     );
   }
 
@@ -846,88 +856,27 @@ function truncateReasoningLine(text, maxLength = 160) {
   return `${value.slice(0, maxLength - 1)}…`;
 }
 
-function toChineseReasoningLine(line) {
-  const value = String(line || "").trim();
-  if (!value) {
-    return "";
-  }
-
-  const stripped = value
-    .replace(/^\*+|\*+$/g, "")
-    .replace(/^【web_search】$/i, "【网页检索】")
-    .replace(/^web_search$/i, "网页检索");
-
-  if (/[\u4e00-\u9fff]/.test(stripped)) {
-    return stripped;
-  }
-
-  const normalized = stripped.toLowerCase();
-  if (/^(planning|plan|scoping|exploring|checking|verifying|validating)/.test(normalized)) {
-    return "【思考】规划下一步处理";
-  }
-  if (/^(generating|creating|building|writing)/.test(normalized)) {
-    return "【思考】生成结果内容";
-  }
-  if (/^(fetching|requesting|querying|searching)/.test(normalized)) {
-    return "【思考】拉取并核对数据";
-  }
-  if (/^(final|finalizing)/.test(normalized)) {
-    return "【思考】整理最终回复";
-  }
-
-  if (/[A-Za-z]{4,}/.test(stripped)) {
-    return "【思考】处理中";
-  }
-  return stripped;
-}
-
 function summarizeCommandForReasoning(command) {
-  const raw = String(command || "");
-  if (!raw.trim()) {
+  const raw = String(command || "").trim();
+  if (!raw) {
     return "";
   }
 
   const sanitized = sanitizeReasoningText(raw);
-  const oneLine = sanitized.replace(/\r?\n+/g, " ").replace(/\s+/g, " ").trim();
-
-  const artifactMatch = sanitized.match(/artifacts\/[^\s"'`]+/i);
-  const urlMatch = sanitized.match(/https?:\/\/[^\s"'`]+/i);
-  if (/<<\s*['"]?[A-Za-z0-9_]+['"]?/.test(sanitized) || /\n/.test(sanitized)) {
-    if (artifactMatch) {
-      return `生成文件 ${artifactMatch[0]}`;
-    }
-    if (/python\d?/i.test(sanitized)) {
-      return "执行内联 Python 脚本";
-    }
-    if (/node\b/i.test(sanitized)) {
-      return "执行内联 Node 脚本";
-    }
-    return "执行多行脚本";
-  }
-
-  if (artifactMatch) {
-    return `处理文件 ${artifactMatch[0]}`;
-  }
-  if (urlMatch && /\bcurl\b|\bwget\b/i.test(sanitized)) {
-    return `请求接口 ${truncateReasoningLine(urlMatch[0], 96)}`;
-  }
-
+  const oneLine = sanitized
+    .replace(/\r?\n+/g, " ; ")
+    .replace(/\s+/g, " ")
+    .trim();
   const unwrapped = oneLine
     .replace(/^(?:\/bin\/)?bash\s+-lc\s+/i, "")
     .replace(/^['"]|['"]$/g, "");
-  return truncateReasoningLine(unwrapped, 140);
+  return truncateReasoningLine(unwrapped, 220);
 }
 
 function prettifyReasoningText(text) {
   if (!text) {
     return "";
   }
-
-  const labelMap = {
-    command_execution: "命令执行",
-    file_change: "文件变更",
-    error: "错误",
-  };
 
   const normalized = sanitizeReasoningText(text)
     .replace(/\r\n/g, "\n")
@@ -943,11 +892,7 @@ function prettifyReasoningText(text) {
     .split("\n")
     .map((line) => line.trim())
     .filter(Boolean)
-    .map((line) =>
-      line.replace(/\[(command_execution|file_change|error)\]/gi, (_, key) => `【${labelMap[key.toLowerCase()] || key}】`)
-    )
-    .map((line) => toChineseReasoningLine(line))
-    .filter(Boolean);
+    .map((line) => truncateReasoningLine(line, 300));
 
   return lines.join("\n");
 }
@@ -1013,10 +958,165 @@ function extractReasoningTextFromItem(item) {
   return sanitizeReasoningText(fields.join("\n")).trim();
 }
 
+function extractSearchQueryFromItem(item) {
+  if (!item || typeof item !== "object") {
+    return "";
+  }
+
+  const queryCandidates = [
+    item.query,
+    item.q,
+    item.keyword,
+    item.search_query,
+    item.text,
+    item.description,
+  ];
+  for (const candidate of queryCandidates) {
+    if (typeof candidate === "string" && candidate.trim()) {
+      return truncateReasoningLine(sanitizeReasoningText(candidate.trim()), 80);
+    }
+  }
+
+  if (item.arguments && typeof item.arguments === "object") {
+    for (const key of ["q", "query", "keyword"]) {
+      const nested = item.arguments[key];
+      if (typeof nested === "string" && nested.trim()) {
+        return truncateReasoningLine(sanitizeReasoningText(nested.trim()), 80);
+      }
+    }
+  }
+
+  return "";
+}
+
+function extractToolNameFromItem(item) {
+  if (!item || typeof item !== "object") {
+    return "";
+  }
+
+  const toolCandidates = [
+    item.tool_name,
+    item.name,
+    item.recipient_name,
+    item.function_name,
+    item.command,
+    item.cmd,
+    item.description,
+  ];
+
+  for (const candidate of toolCandidates) {
+    if (typeof candidate === "string" && candidate.trim()) {
+      return truncateReasoningLine(sanitizeReasoningText(candidate.trim()), 80);
+    }
+  }
+
+  if (typeof item.arguments === "object" && item.arguments) {
+    const nestedName = item.arguments.name || item.arguments.tool || item.arguments.tool_name;
+    if (typeof nestedName === "string" && nestedName.trim()) {
+      return truncateReasoningLine(sanitizeReasoningText(nestedName.trim()), 80);
+    }
+  }
+
+  return "";
+}
+
+function buildActivityLabel(itemType, item) {
+  const normalized = String(itemType || "").toLowerCase().trim();
+
+  if (normalized === "web_search" || normalized === "web_fetch") {
+    const query = extractSearchQueryFromItem(item);
+    return {
+      kind: "web_search",
+      label: query ? `搜索 ${query} 中` : "搜索中",
+    };
+  }
+
+  if (
+    normalized === "tool_call" ||
+    normalized === "mcp_tool_call" ||
+    normalized === "tool_result" ||
+    normalized === "mcp_tool_result"
+  ) {
+    const toolName = extractToolNameFromItem(item);
+    const isSkill = /\bskill[s]?\b|skill-[a-z0-9_-]+/i.test(toolName);
+    const prefix = isSkill ? "调用技能" : "调用工具";
+    return {
+      kind: isSkill ? "skill" : "tool_call",
+      label: toolName ? `${prefix} ${toolName} 中` : `${prefix}中`,
+    };
+  }
+
+  if (normalized === "command_execution") {
+    return {
+      kind: "command_execution",
+      label: "执行命令中",
+    };
+  }
+
+  if (normalized === "file_change") {
+    return {
+      kind: "file_change",
+      label: "修改文件中",
+    };
+  }
+
+  if (normalized === "plan_update" || normalized === "plan") {
+    return {
+      kind: "plan_update",
+      label: "更新计划中",
+    };
+  }
+
+  if (!normalized || normalized === "reasoning" || normalized === "agent_message") {
+    return {
+      kind: "thinking",
+      label: "正在思考",
+    };
+  }
+
+  const fallbackKind = normalized.replace(/[^a-z0-9_-]/g, "") || "other";
+  return {
+    kind: fallbackKind,
+    label: "处理中",
+  };
+}
+
+function extractActivityFromCodexEvent(obj) {
+  if (!obj || typeof obj !== "object") {
+    return null;
+  }
+
+  const eventType = typeof obj.type === "string" ? obj.type : "";
+  if (!eventType.startsWith("item.")) {
+    return null;
+  }
+
+  const item = obj.item;
+  if (!item || typeof item !== "object") {
+    return null;
+  }
+
+  const itemType = typeof item.type === "string" ? item.type : "";
+  const eventPhase = eventType.slice("item.".length) || "event";
+  const active =
+    eventPhase === "completed" || eventPhase === "failed" || eventPhase === "cancelled"
+      ? false
+      : true;
+  const { kind, label } = buildActivityLabel(itemType, item);
+  return {
+    kind,
+    label,
+    active,
+    eventType,
+    itemType: itemType || "event",
+  };
+}
+
 function extractCodexEventParts(obj, { userType = "regular" } = {}) {
   const parts = {
     textDelta: "",
     reasoningDelta: "",
+    activity: null,
   };
 
   if (!obj || typeof obj !== "object") {
@@ -1037,6 +1137,7 @@ function extractCodexEventParts(obj, { userType = "regular" } = {}) {
   if (!item || typeof item !== "object") {
     return parts;
   }
+  parts.activity = extractActivityFromCodexEvent(obj);
 
   const itemType = typeof item.type === "string" ? item.type : "event";
   if (eventType === "item.completed" && itemType === "agent_message" && typeof item.text === "string") {
@@ -1125,6 +1226,7 @@ function runCodex({
   isNewSession,
   onTextChunk,
   onReasoningChunk,
+  onActivity,
   traceTag = "",
   userType = "regular",
 }) {
@@ -1135,7 +1237,11 @@ function runCodex({
     let args = ["exec", "--json", "--skip-git-repo-check"];
 
     if (guestMode) {
-      args.push("--sandbox", "read-only");
+      if (CODEX_GUEST_DANGEROUS) {
+        args.push("--dangerously-bypass-approvals-and-sandbox");
+      } else {
+        args.push("--sandbox", CODEX_GUEST_SANDBOX_MODE);
+      }
       if (CODEX_GUEST_ENABLE_WEB_SEARCH) {
         args.push("--enable", "web_search");
       }
@@ -1161,7 +1267,7 @@ function runCodex({
         "resume",
         "--json",
         "--skip-git-repo-check",
-        ...(guestMode ? ["--sandbox", "read-only"] : []),
+        ...(guestMode && CODEX_GUEST_DANGEROUS ? ["--dangerously-bypass-approvals-and-sandbox"] : []),
         ...(guestMode && CODEX_GUEST_ENABLE_WEB_SEARCH ? ["--enable", "web_search"] : []),
         ...(CODEX_EPHEMERAL ? ["--ephemeral"] : []),
         ...codexConfigArgs,
@@ -1198,6 +1304,8 @@ function runCodex({
       chatId,
       userType: normalizedUserType,
       guestMode,
+      guestSandboxMode: guestMode ? CODEX_GUEST_SANDBOX_MODE : "",
+      guestDangerousMode: guestMode && CODEX_GUEST_DANGEROUS,
       guestWebSearchEnabled: guestMode && CODEX_GUEST_ENABLE_WEB_SEARCH,
       isNewSession,
       knownThreadId: knownThreadId || "",
@@ -1216,6 +1324,7 @@ function runCodex({
     let textDeltaCount = 0;
     let reasoningDeltaCount = 0;
     let lastReasoningDelta = "";
+    let lastActivityKey = "";
 
     child.stdout.on("data", (chunk) => {
       const text = chunk.toString("utf8");
@@ -1246,9 +1355,16 @@ function runCodex({
             debugLog(traceTag, "codex_turn_failed", { message: codexError });
           }
 
-          const { textDelta, reasoningDelta } = extractCodexEventParts(obj, {
+          const { textDelta, reasoningDelta, activity } = extractCodexEventParts(obj, {
             userType: normalizedUserType,
           });
+          if (activity) {
+            const activityKey = JSON.stringify(activity);
+            if (activityKey !== lastActivityKey) {
+              lastActivityKey = activityKey;
+              onActivity?.(activity);
+            }
+          }
           if (reasoningDelta) {
             const normalizedReasoning = reasoningDelta.trim();
             if (normalizedReasoning && normalizedReasoning !== lastReasoningDelta) {
@@ -1261,7 +1377,7 @@ function runCodex({
           if (textDelta) {
             textDeltaCount += 1;
             if (textDelta.trim()) {
-              // Keep only the latest assistant message to avoid leaking process updates.
+              // Codex may emit multiple agent_message items during a turn; keep only the latest.
               fullText = textDelta;
             }
             if (EMIT_INTERMEDIATE_ASSISTANT_TEXT) {
@@ -1303,9 +1419,16 @@ function runCodex({
           if (obj.type === "turn.failed" && typeof obj?.error?.message === "string") {
             codexError = parseStructuredCodexError(obj.error.message);
           }
-          const { textDelta, reasoningDelta } = extractCodexEventParts(obj, {
+          const { textDelta, reasoningDelta, activity } = extractCodexEventParts(obj, {
             userType: normalizedUserType,
           });
+          if (activity) {
+            const activityKey = JSON.stringify(activity);
+            if (activityKey !== lastActivityKey) {
+              lastActivityKey = activityKey;
+              onActivity?.(activity);
+            }
+          }
           if (reasoningDelta) {
             const normalizedReasoning = reasoningDelta.trim();
             if (normalizedReasoning && normalizedReasoning !== lastReasoningDelta) {
@@ -1315,6 +1438,7 @@ function runCodex({
           }
           if (textDelta) {
             if (textDelta.trim()) {
+              // Codex may emit multiple agent_message items during a turn; keep only the latest.
               fullText = textDelta;
             }
             if (EMIT_INTERMEDIATE_ASSISTANT_TEXT) {
@@ -1379,6 +1503,7 @@ function runCodexWithFallback({
   isNewSession,
   onTextChunk,
   onReasoningChunk,
+  onActivity,
   traceTag = "",
   userType = "regular",
 }) {
@@ -1390,6 +1515,7 @@ function runCodexWithFallback({
         isNewSession,
         onTextChunk,
         onReasoningChunk,
+        onActivity,
         traceTag,
         userType,
       });
@@ -1412,6 +1538,7 @@ function runCodexWithFallback({
           isNewSession: true,
           onTextChunk,
           onReasoningChunk,
+          onActivity,
           traceTag,
           userType,
         });
@@ -1442,7 +1569,7 @@ function writeOpenAiSseDone(res) {
   res.end();
 }
 
-function createChunk({ id, model, content, reasoning }) {
+function createChunk({ id, model, content, reasoning, activity }) {
   return {
     id,
     object: "chat.completion.chunk",
@@ -1454,6 +1581,7 @@ function createChunk({ id, model, content, reasoning }) {
         delta: {
           ...(content ? { content } : {}),
           ...(reasoning ? { reasoning } : {}),
+          ...(activity ? { activity } : {}),
         },
         finish_reason: null,
       },
@@ -1778,6 +1906,12 @@ const server = http.createServer(async (req, res) => {
           }
           emittedReasoningLength = redacted.length;
           writeOpenAiSseChunk(res, createChunk({ id, model, reasoning: delta }));
+        },
+        onActivity: (activity) => {
+          if (!activity || typeof activity !== "object") {
+            return;
+          }
+          writeOpenAiSseChunk(res, createChunk({ id, model, activity }));
         },
       });
 
